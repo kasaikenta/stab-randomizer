@@ -1,5 +1,4 @@
-\
-# Stabilizer LDPC Randomizer — Paper-Style README (English)
+# Stabilizer LDPC Randomizer — Technical README (English, No LaTeX)
 
 **Author:** Kenta Kasai
 
@@ -7,194 +6,183 @@
 
 ## Abstract
 
-This program implements a randomization algorithm for stabilizer LDPC matrices \(H_X, H_Z\). It repeatedly applies **2×2 cross-swaps** to \(H_X\) while maintaining the **stabilizer commutation condition**
+This program implements a randomization algorithm for stabilizer LDPC matrices `HX` and `HZ`. It repeatedly applies 2x2 cross‑swaps to `HX` and performs a local symmetric repair of `HZ` so that the global stabilizer commutation constraint remains satisfied:
 
-\[
-H_X H_Z^\top \oplus H_Z H_X^\top = 0 \quad (\text{over GF(2)}).
-\]
+```
+HX HZ^T XOR HZ HX^T = 0    (over GF(2))
+```
 
-Every proposed change of \(H_X\) is followed by a **local symmetric repair** of \(H_Z\) obtained by solving a **general stabilizer linear system** on a restricted domain. The implementation is fully sparse (set-based) and preserves both row and column weights.
+All data structures are fully sparse (set‑based). The procedure preserves row and column weights by construction and validates the stabilizer constraint before committing any change.
 
 ---
 
 ## 1. Background and Objective
 
-In quantum LDPC code design, one must construct sparse matrices \((H_X, H_Z)\) that satisfy the stabilizer commutation constraint. This program introduces controlled randomness into \(H_X\) via weight-preserving cross-swaps and then performs localized algebraic repairs of \(H_Z\) so that the pair continues to commute. The method directly enforces the general stabilizer constraint without special-structure assumptions.
+The goal is to construct sparse binary matrices (`HX`, `HZ`) that commute in the stabilizer sense. The algorithm adds controlled randomness to `HX` via weight‑preserving 2x2 cross‑swaps and then repairs `HZ` locally by solving a small general stabilizer linear system on a restricted domain. The approach is algebraic, uses only GF(2) arithmetic, and does not assume special structure beyond the stabilizer constraint itself.
 
 ### Contributions
-- Local repair formulated and solved as a **general (symmetric) GF(2) linear system** on a small domain.
-- Adoption of solutions that satisfy **row/column weight balance** constraints within the domain.
-- **Exact DFS** fallback for very small systems.
-- Fully sparse (set-of-indices) data structure for clarity and extensibility.
+
+- Local repair framed as a general (symmetric) GF(2) linear system on a small domain
+- Adoption of solutions that preserve row/column weights inside the domain
+- Exact DFS fallback for tiny systems
+- Purely sparse (set‑of‑indices) implementation using only the Python standard library
 
 ---
 
 ## 2. Preliminaries and Notation
 
-- Field: GF(2). Addition is XOR; set operations use symmetric differences.
-- A sparse binary matrix is represented by **row-support sets** \(\mathrm{rows}[i]\subseteq[n)\) and **column-support sets** \(\mathrm{cols}[j]\subseteq[m)\).
-- Parity inner product:
-  \[
-  \langle a,b\rangle := |a\cap b| \bmod 2
-  \]
-  (implemented by `dot_parity`).
-- Initial matrices use a tiled block-ID construction with block size \(P\), block rows \(d_c\), and block columns \(d_r\):
-  \[
-  m=d_c P,\quad n=d_r P,\quad \text{row weight}=d_r,\quad \text{column weight}=d_c.
-  \]
+- Field: GF(2). Addition is XOR; we use set symmetric difference for sparse operations.
+- Sparse binary matrices are represented by two lists of sets:
+  - `rows[i]` = set of column indices `j` with `A[i,j] = 1`
+  - `cols[j]` = set of row indices `i` with `A[i,j] = 1`
+- Parity inner product between two supports `a` and `b` is `parity(|a ∩ b|)`.
+- Initial construction: a tiled block‑ID pattern with parameters `P` (block size), `dc` (block rows) and `dr` (block columns). This yields
+  - number of rows `m = dc * P`
+  - number of columns `n = dr * P`
+  - uniform row weight `dr` and column weight `dc`
 
-**Stabilizer commutation.** A pair \((H_X,H_Z)\) is commuting iff
-\[
-H_X H_Z^\top \oplus H_Z H_X^\top = O_{m\times m},
-\]
-equivalently, for all \((k,i)\),
-\[
-\langle H_X[k,:], H_Z[i,:]\rangle \oplus \langle H_Z[k,:], H_X[i,:]\rangle = 0.
-\]
+**Stabilizer commutation (global check).** For all row pairs `(k, i)`,
+```
+parity( HX[k] ∩ HZ[i] ) XOR parity( HZ[k] ∩ HX[i] ) = 0
+```
+The function `stabilizer_violation_positions(HX, HZ)` enumerates all violating pairs.
 
 ---
 
-## 3. Cross-Swap (2×2)
+## 3. Cross‑Swap (2x2) on HX
 
-Given rows \(i_1,i_2\) and columns \(j_1,j_2\), the \(2\times2\) submatrix
-\[
-\begin{bmatrix} a & b \\ c & d \end{bmatrix}
-\]
-is *swappable* iff \((a,d)=(1,1)\) and \((b,c)=(0,0)\), or vice versa. Toggling all four entries then **preserves row/column weights** (`is_valid_cross_pattern`, `cross_swap_in_place`). We apply this only to \(H_X\) to diversify structure while keeping degrees fixed.
+Pick two distinct rows `i1`, `i2` and two distinct columns `j1`, `j2`. Consider the 2x2 submatrix
+```
+[ a  b ]
+[ c  d ]
+```
+It is swappable iff either `(a, d) = (1, 1)` and `(b, c) = (0, 0)` or the opposite. Toggling all four entries preserves both row and column weights. We apply this operation only to `HX`.
 
-**Lemma (Weight preservation).** Each affected row/column loses two 1s and gains two 1s (or the reverse), hence degrees remain unchanged.
+**Weight preservation.** Each affected row/column loses two 1s and gains two 1s (or vice versa), so degrees remain unchanged.
 
 ---
 
-## 4. Local Repair Formulation (General Stabilizer System)
+## 4. Local Repair (General Stabilizer System)
 
-Let \(H'_X\) denote the swapped matrix. We seek a correction \(\Delta\) such that \(H'_Z := H_Z \oplus \Delta\) restores commutation. Over GF(2),
-\[
-H'_X (H_Z \oplus \Delta)^\top \oplus (H_Z \oplus \Delta) H'_X{}^\top = O,
-\]
-which linearizes to
-\[
-H'_X H_Z^\top \oplus H_Z H'_X{}^\top \oplus H'_X \Delta^\top \oplus \Delta H'_X{}^\top = O.
-\]
-Thus, \(\Delta\) must satisfy
-\[
-H'_X \Delta^\top \oplus \Delta H'_X{}^\top = H'_X H_Z^\top \oplus H_Z H'_X{}^\top.
-\tag{1}
-\]
+Let `HX'` be the swapped matrix. We seek a binary correction `Δ` such that `HZ' = HZ XOR Δ` restores commutation. Over GF(2) the required condition is equivalent to the linear system:
+```
+HX' Δ^T XOR Δ HX'^T = HX' HZ^T XOR HZ HX'^T    (Eq. 1)
+```
 
-We restrict \(\Delta\) to a **local domain** \(I\times J\) determined by the touched columns:
-- \(I\): rows reachable via \(H_Z\),
-- \(J\): columns reachable from \(I\) via \(H_Z\) or \(H'_X\),
-- \(K\): rows reachable from \(J\) via \(H'_X\) or \(H_Z\) (allowing \(K\cap I\)).
+We restrict `Δ` to a local domain `I × J` determined by the columns touched in the swap:
+- `I`: rows reachable via `HZ`
+- `J`: columns reachable from `I` via `HZ` or `HX'`
+- `K`: rows reachable from `J` via `HX'` or `HZ` (K may intersect I)
 
-The linear system (1) is assembled on \(I\times J\) (`assemble_general`).
+The system in Eq. 1 is assembled only on `I × J` and only for rows in `K` (function `assemble_general`).
 
-**Balance constraints.** To preserve row/column weights within \(I\times J\),
-\[
-\sum_{j\in J} \sigma_{ij}=0,\qquad \sum_{i\in I} \sigma_{ij}=0,
-\]
-where \(\sigma_{ij}=+1\) for \(0\to1\) and \(-1\) for \(1\to0\). This is checked by `balanced_solution_from_vector`.
+**Balance constraints (weight preservation inside I × J).**
+- For every `i` in `I`, the number of `0→1` flips equals the number of `1→0` flips across columns in `J`.
+- For every `j` in `J`, the number of `0→1` flips equals the number of `1→0` flips across rows in `I`.
+The function `balanced_solution_from_vector` checks these constraints for a candidate solution.
 
 ---
 
 ## 5. Solvers
 
-- Solve (1) by sparse Gaussian elimination over GF(2) (`solve_gf2_sparse`).  
-- Apply \(\Delta\) only if **balance** constraints are satisfied.  
-- Accept the candidate \((H'_X,H'_Z)\) **only after global stabilizer validation**.  
-- If the system is tiny (by default, \(\le 24\) variables), run an **exact DFS** (`exact_balanced_solver`) with balance constraints.
+1. Solve Eq. 1 using sparse Gaussian elimination over GF(2) (`solve_gf2_sparse`).
+2. Accept a candidate `Δ` only if balance constraints hold.
+3. Apply `Δ` to obtain `HZ'` and run the global stabilizer validation. Only if it passes do we commit the change.
+4. If the system is tiny (default: at most 24 variables), an exact DFS solver (`exact_balanced_solver`) is available as a fallback.
 
 ---
 
-## 6. Algorithm (Pseudo-Code)
+## 6. Algorithm Outline
 
-```text
-Input: P, d_c, d_r, steps, seed
-H_X ← block_id(P, d_c, d_r)
-H_Z ← block_id(P, d_c, d_r)
+```
+Input: P, dc, dr, steps, seed
+HX ← block_id(P, dc, dr)
+HZ ← block_id(P, dc, dr)
 
-for t = 1..steps:
-  for trial = 1..max_trials:
-    pick (i1,i2,j1,j2) with valid cross pattern on H_X
-    H'_X ← swap(H_X, i1,i2,j1,j2)
-    assert deg(H'_X) == deg(H_X)  // weight preservation
+for t in 1..steps:
+  committed ← false
+  for trial in 1..max_trials:
+    (i1,i2,j1,j2) ← find_valid_cross_swap(HX)
+    if none: break
 
-    (I,J,K) ← build_local_sets_general(H'_X, H_Z, touched={j1,j2})
-    (A,b)   ← assemble_general(H'_X, H_Z, I,J,K)  // Eq. (1) on I×J
+    HX' ← HX with cross-swap at (i1,i2,j1,j2)
+    assert row/col weights preserved
+
+    (I,J,K) ← build_local_sets_general(HX', HZ, touched={j1,j2})
+    (A,b)   ← assemble_general(HX', HZ, I,J,K)
     x       ← solve_gf2_sparse(A,b)
 
-    if x is None or not balanced(x):
-       if |x| small: x ← exact_balanced_solver(A,b, balance)
+    if x is none or not balanced(x):
+       if num_vars(x) small: x ← exact_balanced_solver(A,b)
        else: continue
 
-    H'_Z ← apply_delta(H_Z, x)
-    if stabilizer_ok(H'_X, H'_Z):
-       (H_X, H_Z) ← (H'_X, H'_Z)   // commit & print
-       break  // next t
-  if not committed: report "no feasible swap"
+    HZ' ← apply_delta(HZ, x)
+    if stabilizer_ok(HX', HZ'):
+       HX ← HX'; HZ ← HZ'; committed ← true; print matrices; break
+
+  if not committed:
+    print "no feasible swap"
 ```
 
-**Correctness sketch.** (i) Cross-swaps preserve degrees of \(H_X\). (ii) Any \(\Delta\) solving (1) recovers commutation for the updated pair. (iii) Balance preserves local row/column weights of \(H_Z\). (iv) The final global check prevents inconsistent commits.
+**Correctness sketch.** Cross‑swaps preserve degrees of `HX`. Any `Δ` that satisfies Eq. 1 recovers commutation for the updated pair. Balance constraints preserve row/column weights in the local domain of `HZ`. A final global check prevents inconsistent commits.
 
 ---
 
 ## 7. Complexity and Parameters
 
-- **Global validation:** worst-case \(O(m^2 \bar{w})\) where \(\bar{w}\) is the average row weight.  
-- **Local assembly:** \(O(|I|\cdot|J|)\).  
-- **Sparse elimination:** practical up to a few hundred variables.  
-- **DFS fallback:** exponential; default cap is 24 variables.
+- Global validation: roughly `O(m^2 * average_row_weight)` in the naive form.
+- Local assembly: scales with `|I| * |J|`.
+- Sparse elimination: practical up to a few hundred variables (depends on sparsity).
+- DFS fallback: exponential; capped by a variable limit (default 24).
 
-**Parameter guidelines.**
-- `max_domain_size = |I|\cdot|J|` around 200–600 is usually practical.
-- `dfs_var_cap` around 20–26 is reasonable; larger values may explode runtime.
-- Start with small `steps` to limit output size.
+Recommended settings:
+- `max_domain_size = |I| * |J|` around 200–600
+- `dfs_var_cap` around 20–26
+- Keep `steps` small for interactive runs to reduce output size
 
 ---
 
-## 8. Implementation Map (Key Functions)
+## 8. Key Functions (Map)
 
-- `SparseBinMat`: sparse matrix container (`add`, `toggle`, `copy`, `nnz`).
-- `dot_parity`: parity inner product (iterate over the smaller set).
-- `is_valid_cross_pattern` / `cross_swap_in_place` / `find_valid_cross_swap`: cross-swap utilities.
-- `make_block_id_sparse`: block-ID initializer.
-- `stabilizer_violation_positions`: global commutation checker.
-- `build_local_sets_general`: extracts local domain \(I,J,K\).
-- `assemble_general`: sparse assembly of (1).
-- `solve_gf2_sparse`: sparse Gaussian elimination over GF(2).
-- `balanced_solution_from_vector`: balance check for row/column weights.
-- `exact_balanced_solver`: exact DFS with balance constraints.
-- `adaptive_local_repair`: end-to-end local repair pipeline (general system only).
-- `repeat_swaps_and_repairs_safe`: main loop (propose → repair → verify → commit).
-- `print_sparse_01`: full 0/1 matrix printing for debugging.
+- `SparseBinMat`: sparse matrix container (`add`, `toggle`, `copy`, `nnz`)
+- `dot_parity`: parity of set intersection
+- `is_valid_cross_pattern`, `cross_swap_in_place`, `find_valid_cross_swap`: cross‑swap utilities
+- `make_block_id_sparse`: block‑ID initializer
+- `stabilizer_violation_positions`: global commutation checker
+- `build_local_sets_general`: extracts local domain `(I, J, K)`
+- `assemble_general`: builds the local linear system (Eq. 1)
+- `solve_gf2_sparse`: sparse Gaussian elimination over GF(2)
+- `balanced_solution_from_vector`: weight‑balance check
+- `exact_balanced_solver`: exact DFS for tiny systems
+- `adaptive_local_repair`: orchestrates the local repair pipeline
+- `repeat_swaps_and_repairs_safe`: main loop (swap → repair → verify → commit)
+- `print_sparse_01`: full 0/1 matrix printer (debug)
 
 ---
 
 ## 9. Usage
 
-```bash
+```
 python3 stab-randomizer.py
 ```
 Default parameters in the script:
-- `P=25, d_c=3, d_r=4, steps=2000, seed=42, max_trials=300`
-- In `adaptive_local_repair`: `max_domain_size=400, dfs_var_cap=24`
+- `P=25`, `dc=3`, `dr=4`, `steps=2000`, `seed=42`, `max_trials=300`
+- Local repair defaults: `max_domain_size=400`, `dfs_var_cap=24`
 
-Use **Python 3.10+**. If you include `from __future__ import annotations`, place it at the **top of the file**.
+Python 3.10 or newer is recommended. If you use `from __future__ import annotations`, place it at the top of the file.
 
 ---
 
 ## 10. Limitations and Future Work
 
-- Acceptance and convergence rates are empirical at present.
-- The neighborhood design (\(I,J,K\)) can be further optimized.
-- Code distance, rank, and degeneracy evaluation are not yet implemented.
-- Parallelizing swap search and validation is left as future work.
+- Acceptance and convergence rates are currently empirical.
+- Neighborhood design `(I, J, K)` can be further optimized.
+- Code distance, rank, and degeneracy evaluation are not included.
+- Parallelization for swap search and validation is left for future work.
+
 
 ---
 
-
 ## License
-Intended for research and educational release. Please choose and state an open-source license (e.g., MIT, BSD-3, Apache-2.0) when publishing.
 
-## Acknowledgment
-Prepared in a paper-style format with equations and a brief correctness sketch for academic reuse.
+Intended for research and educational release. Please include an open‑source license file (e.g., MIT, BSD‑3, Apache‑2.0) when publishing.
