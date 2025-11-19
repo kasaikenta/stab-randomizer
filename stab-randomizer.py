@@ -191,6 +191,16 @@ def find_valid_cross_swap(
     """
     Randomly search for a valid 2×2 cross-swap on H_X.
 
+    Algorithm
+    ---------
+    1. Uniformly sample two distinct rows (i1,i2).
+    2. Form the set of candidate columns touched by either row and, if there
+       are at least two, uniformly sample two columns (j1,j2).
+    3. Check whether the 2×2 submatrix induced by (i1,i2,j1,j2) is a
+       cross-pattern whose diagonals can be toggled without changing row/column
+       weights via ``is_valid_cross_pattern``.
+    4. Repeat up to ``max_trials`` times, returning the first valid tuple.
+
     Parameters
     ----------
     HX : SparseBinMat
@@ -292,75 +302,6 @@ def stabilizer_violation_positions(HX: SparseBinMat, HZ: SparseBinMat) -> List[T
 # Neighborhood builders (sparse)
 # ==============================
 
-def build_local_sets_css(
-    HXp: SparseBinMat,
-    HZ: SparseBinMat,
-    touched_cols: Set[int],
-    max_I: int = 16,
-    max_J: int = 32,
-    max_K: int = 32
-) -> Tuple[Set[int], Set[int], Set[int]]:
-    """
-    Build local index sets (I, J, K) for a CSS-like repair where K ∩ I = ∅.
-    This structure removes the Δ term on the RHS in the linearization.
-
-    Parameters
-    ----------
-    HXp : SparseBinMat
-        Candidate H_X after a proposed swap.
-    HZ : SparseBinMat
-        Current H_Z to be locally repaired if needed.
-    touched_cols : Set[int]
-        Columns touched by the swap; expansion starts from here.
-    max_I, max_J, max_K : int
-        Limits on the size of the local neighborhoods.
-
-    Returns
-    -------
-    (I, J, K) : Tuple[Set[int], Set[int], Set[int]]
-        I = rows tied to touched columns via HZ,
-        J = columns touched by I via HZ or HXp,
-        K = rows touched by J via HXp but excluding I.
-    """
-    I: Set[int] = set()
-    for j in touched_cols:
-        for i in HZ.cols[j]:
-            I.add(i)
-            if len(I) >= max_I:
-                break
-        if len(I) >= max_I:
-            break
-    if not I:
-        return set(), set(), set()
-
-    J: Set[int] = set()
-    for i in list(I):
-        for j in HZ.rows[i]:
-            J.add(j)
-            if len(J) >= max_J:
-                break
-        for j in HXp.rows[i]:
-            J.add(j)
-            if len(J) >= max_J:
-                break
-        if len(J) >= max_J:
-            break
-    if not J:
-        return set(), set(), set()
-
-    K: Set[int] = set()
-    for j in list(J):
-        for k in HXp.cols[j]:
-            if k not in I:
-                K.add(k)
-                if len(K) >= max_K:
-                    break
-        if len(K) >= max_K:
-            break
-
-    return I, J, K
-
-
 def build_local_sets_general(
     HXp: SparseBinMat,
     HZ: SparseBinMat,
@@ -372,6 +313,16 @@ def build_local_sets_general(
     """
     Build local index sets (I, J, K) for the general stabilizer case (K may
     intersect I). Use this when the CSS-like builder fails.
+
+    Algorithm
+    ---------
+    1. Seed ``I`` with rows of H_Z incident to the touched columns until the
+       ``max_I`` cap is met.
+    2. Expand to ``J`` by collecting every column touched by rows in ``I`` from
+       both H'_X and H_Z (capped by ``max_J``).
+    3. Expand again to ``K`` via rows touching the provisional ``J`` columns in
+       either matrix (capped by ``max_K``).
+    4. Abort early if any frontier is empty so the caller can try another swap.
 
     Parameters
     ----------
@@ -421,52 +372,6 @@ def build_local_sets_general(
 # Local linear systems (A x = b)
 # ==========================
 
-def assemble_css_like(
-    HXp: SparseBinMat,
-    HZ: SparseBinMat,
-    I: Set[int],
-    J: Set[int],
-    K: Set[int]
-):
-    """
-    Assemble the CSS-like local linear system over GF(2):
-
-        For k∈K and i∈I:
-          (H'_X)_{k,J} · Δ_{i,J}^T = (H'_X H_Z^T)_{k,i}
-
-    Variables are Δ_{i,j} for i∈I, j∈J.
-
-    Returns
-    -------
-    row_eqs : List[Set[int]]
-        Each row is a set of active column indices (sparse representation).
-    rhs : List[int]
-        Right-hand side bits.
-    var_index : Dict[Tuple[int,int], int]
-        Mapping (i, j) → variable column index in the system.
-    I_list, J_list : List[int]
-        Ordered lists of I and J used to build var_index.
-    """
-    I_list = sorted(I); J_list = sorted(J); K_list = sorted(K)
-    var_index: Dict[Tuple[int,int], int] = {
-        (i, j): idx
-        for idx, (i, j) in enumerate((ii, jj) for ii in I_list for jj in J_list)
-    }
-
-    row_eqs: List[Set[int]] = []
-    rhs: List[int] = []
-    Jset = set(J_list)
-
-    for k in K_list:
-        HXk_on_J = HXp.rows[k] & Jset
-        for i in I_list:
-            eq = {var_index[(i, j)] for j in HXk_on_J}
-            e = dot_parity(HXp.rows[k], HZ.rows[i])
-            row_eqs.append(eq)
-            rhs.append(e)
-    return row_eqs, rhs, var_index, I_list, J_list
-
-
 def assemble_general(
     HXp: SparseBinMat,
     HZ: SparseBinMat,
@@ -483,10 +388,28 @@ def assemble_general(
 
     When k∉I, the Δ_{k,J} term is implicitly zero.
 
+    Algorithm
+    ---------
+    * Sort I,J,K to obtain deterministic index lists and assign each (i,j)∈I×J
+      a column in the linear system.
+    * For every k∈K build one equation per i∈I by:
+        a) Adding the variables corresponding to overlaps between row k of H'_X
+           and the J-domain (first bilinear term).
+        b) When k∈I, adding the variables representing row i overlaps so the
+           second bilinear term shares coefficients with Δ_{k,J}.
+    * Emit the commutator parity on the right-hand side using the original HX
+      and HZ rows.
+
     Returns
     -------
-    (row_eqs, rhs, var_index, I_list, J_list)
-      See `assemble_css_like` for field meanings.
+    row_eqs : List[Set[int]]
+        Sparse equations representing the linear system.
+    rhs : List[int]
+        Right-hand side bits.
+    var_index : Dict[Tuple[int, int], int]
+        Mapping (i, j) → column indices in the linear system.
+    I_list, J_list : List[int]
+        Ordered lists describing the row/column domains used above.
     """
     I_list = sorted(I); J_list = sorted(J); K_list = sorted(K)
     var_index: Dict[Tuple[int,int], int] = {
@@ -525,6 +448,17 @@ def solve_gf2_sparse(row_eqs: List[Set[int]], rhs: List[int], nvars: int) -> Opt
     Solve A x = b over GF(2) where each row of A is given as a set of active
     column indices (sparse support). Uses a simple sparse Gaussian elimination
     with symmetric-difference operations on sets.
+
+    Algorithm
+    ---------
+    1. Clone each row support so mutations do not leak to callers.
+    2. Sweep the rows from top to bottom, picking the smallest column index in
+       the current support as the candidate pivot. If that column already has a
+       pivot row, symmetric-difference the two rows (elimination); otherwise
+       record the pivot and eliminate the column from all lower rows.
+    3. Abort immediately when a zero row has RHS=1 (inconsistent system).
+    4. Perform a backward sweep that assigns pivot variables first and treats
+       unpivoted variables as free zeros.
 
     Parameters
     ----------
@@ -630,6 +564,17 @@ def exact_balanced_solver(
     Exact brute-force (DFS) solver for tiny local systems with balance constraints.
     Useful when elimination under-constrains the solution and we need an exact,
     weight-preserving Δ.
+
+    Algorithm
+    ---------
+    * Precompute equation adjacencies and the ±1 contribution that each
+      variable would apply to every affected row/column balance in H_Z.
+    * Order the variables by decreasing equation degree for stronger pruning.
+    * Run depth-first search that first tries assigning 0, then 1. When testing
+      1 the solver flips cached parities and accumulates row/column balances,
+      unwinding on backtrack.
+    * Terminate when every equation parity matches ``rhs`` and all balances are
+      zero, or when the node budget ``max_nodes`` is exceeded.
 
     Parameters
     ----------
@@ -823,28 +768,41 @@ def repeat_swaps_and_repairs_safe(
     max_trials: int = 300
 ) -> Tuple[SparseBinMat, SparseBinMat]:
     """
-    H_X に対してランダム交差スワップを繰り返し、H_Z を局所修復する。
-    各ステップでスタビライザ制約 (H_X H_Z^T ⊕ H_Z H_X^T = 0) を検証。
+    Repeatedly apply random cross-swaps to H_X and repair H_Z locally.
+    Validate the stabilizer constraint (H_X H_Z^T ⊕ H_Z H_X^T = 0) at each step.
+
+    Algorithm
+    ---------
+    1. Initialize H_X and H_Z with the balanced block-diagonal pattern produced
+       by ``make_block_id_sparse``.
+    2. For every outer iteration, repeatedly sample a valid cross-swap via
+       ``find_valid_cross_swap`` and simulate it on a copy of H_X.
+    3. Invoke ``adaptive_local_repair`` to obtain a candidate H_Z update, and
+       discard the attempt unless the commutator violations disappear.
+    4. Commit the new pair (H_X, H_Z) only when weights and commutation checks
+       succeed, otherwise try another swap until ``max_trials`` is exhausted.
+    5. Emit verbose diagnostics—including the full matrices—after each commit
+       and re-check the constraint at the very end.
 
     Parameters
     ----------
     P : int
-        初期ブロックの巡回サイズ。
+        Block period for the initial construction.
     dc : int
-        列重み。
+        Column weight.
     dr : int
-        行重み。
+        Row weight.
     steps : int
-        外側反復回数。
+        Number of outer iterations.
     seed : int
-        乱数シード。
+        Random seed.
     max_trials : int
-        スワップ探索の最大試行数。
+        Maximum attempts for finding a valid swap per step.
 
     Returns
     -------
     Tuple[SparseBinMat, SparseBinMat]
-        最終的な (H_X, H_Z)。
+        The final (H_X, H_Z).
     """
     rng = random.Random(seed)
 
@@ -864,7 +822,7 @@ def repeat_swaps_and_repairs_safe(
             i1, i2, j1, j2 = pick
             HXp = HX.copy()
 
-            # スワップ前後の重みチェック
+            # Check row/column weights before and after the swap
             row_w_before = [len(HX.rows[i]) for i in range(HX.m)]
             col_w_before = [len(HX.cols[j]) for j in range(HX.n)]
 
@@ -873,31 +831,31 @@ def repeat_swaps_and_repairs_safe(
             row_w_after = [len(HXp.rows[i]) for i in range(HXp.m)]
             col_w_after = [len(HXp.cols[j]) for j in range(HXp.n)]
             assert row_w_before == row_w_after and col_w_before == col_w_after, \
-                "H_X の重みがスワップで変化しています"
+                "H_X weights changed during the swap"
 
-            # 局所修復を試す
+            # Attempt a local repair
             ok, HZ_new = adaptive_local_repair(HX, HZ, HXp, {j1, j2})
 
             if ok:
-                # 修復後のスタビライザ制約を検証
+                # Validate the stabilizer constraint after repair
                 viol = stabilizer_violation_positions(HXp, HZ_new)
                 if viol:
-                    print(f"[step {t}] ⚠️ 可換条件違反 {len(viol)} 件 — 修復を破棄")
-                    continue  # 破棄して次の試行へ
+                    print(f"[step {t}] ⚠️ {len(viol)} commutation violations — discarding repair")
+                    continue  # Discard and try again
 
-                # 問題なし → コミット
+                # No issues → commit
                 HX, HZ = HXp, HZ_new
                 success_count += 1
                 print(f"[step {t}] committed at trial {trial} (Global E=0, weights preserved)")
                 print_sparse_01(HX, "H_X")
                 print_sparse_01(HZ, "H_Z")
 
-                # 確認: スタビライザ条件最終チェック
+                # Double-check: final stabilizer condition
                 final_viol = stabilizer_violation_positions(HX, HZ)
                 if final_viol:
-                    print(f"[check] ⚠️ コミット後に {len(final_viol)} 件の可換違反が残存")
+                    print(f"[check] ⚠️ {len(final_viol)} commutation violations remain after commit")
                 else:
-                    print(f"[check] ✅ スタビライザ条件 OK")
+                    print(f"[check] ✅ Stabilizer constraint OK")
 
                 #print(f"[summary] commits so far: {success_count}/{t}")
                 committed = True
@@ -908,579 +866,16 @@ def repeat_swaps_and_repairs_safe(
 
     print(f"[final] total commits: {success_count}/{steps}")
 
-    # 最終的な可換条件チェック
+    # Final commutation check
     final_viol = stabilizer_violation_positions(HX, HZ)
     if final_viol:
-        print(f"[final check] ⚠️ 最終的に {len(final_viol)} 件の可換違反があります")
+        print(f"[final check] ⚠️ {len(final_viol)} commutation violations remain in the final state")
     else:
-        print("[final check] ✅ 最終 H_X, H_Z は可換条件を満たしています")
+        print("[final check] ✅ Final H_X and H_Z satisfy the commutation constraint")
 
     return HX, HZ
 
 
 if __name__ == "__main__":
     # Consider reducing 'steps' for interactive runs to avoid huge output.
-    repeat_swaps_and_repairs_safe()
-# -*- coding: utf-8 -*-
-"""
-Stabilizer LDPC: repeated cross-swap + local repair (general stabilizer only)
-
-- Fully sparse (set-based) implementation, suitable for moderate/large P
-- H_X is modified only by valid 2×2 cross-swaps that preserve row/col weights
-- H_Z is locally repaired by solving a symmetric (general) GF(2) system
-- Row/column weights in the local domain are preserved via balance checks
-- Stabilizer constraint is verified before commit, after commit, and at the end:
-
-      H_X H_Z^T ⊕ H_Z H_X^T = 0  over GF(2)
-
-Notes:
-- Prints full matrices on each commit (may be verbose).
-- Reduce `steps` for interactive runs.
-"""
-from dataclasses import dataclass
-from typing import List, Set, Dict, Tuple, Optional
-import random
-
-# ========================
-# Sparse binary matrix API
-# ========================
-
-@dataclass
-class SparseBinMat:
-    """
-    Sparse binary matrix represented by sets of indices:
-      rows[i] = { j | A[i,j] = 1 }
-      cols[j] = { i | A[i,j] = 1 }
-    """
-    m: int
-    n: int
-    rows: List[Set[int]]
-    cols: List[Set[int]]
-
-    @staticmethod
-    def zeros(m: int, n: int) -> "SparseBinMat":
-        return SparseBinMat(m, n, [set() for _ in range(m)], [set() for _ in range(n)])
-
-    def copy(self) -> "SparseBinMat":
-        return SparseBinMat(self.m, self.n, [set(s) for s in self.rows], [set(s) for s in self.cols])
-
-    def add(self, i: int, j: int) -> None:
-        if j not in self.rows[i]:
-            self.rows[i].add(j)
-            self.cols[j].add(i)
-
-    def toggle(self, i: int, j: int) -> None:
-        if j in self.rows[i]:
-            self.rows[i].remove(j)
-            self.cols[j].remove(i)
-        else:
-            self.rows[i].add(j)
-            self.cols[j].add(i)
-
-    def nnz(self) -> int:
-        return sum(len(r) for r in self.rows)
-
-
-# ================
-# GF(2) primitives
-# ================
-
-def dot_parity(a: Set[int], b: Set[int]) -> int:
-    """Parity of |a ∩ b| (inner product over GF(2))."""
-    if len(a) > len(b):
-        a, b = b, a
-    s = 0
-    for x in a:
-        if x in b:
-            s ^= 1
-    return s
-
-
-# ===============
-# Cross-swap on H_X
-# ===============
-
-def is_valid_cross_pattern(H: SparseBinMat, i1: int, i2: int, j1: int, j2: int) -> bool:
-    """
-    2×2 submatrix:
-        [a b]
-        [c d]
-    is swappable iff (a,d)=(1,1) and (b,c)=(0,0), or the opposite.
-    This preserves row/column weights after toggling the four entries.
-    """
-    a = (j1 in H.rows[i1]); b = (j2 in H.rows[i1])
-    c = (j1 in H.rows[i2]); d = (j2 in H.rows[i2])
-    return (a and d and not b and not c) or (b and c and not a and not d)
-
-def cross_swap_in_place(HX: SparseBinMat, i1: int, i2: int, j1: int, j2: int) -> None:
-    HX.toggle(i1, j1)
-    HX.toggle(i1, j2)
-    HX.toggle(i2, j1)
-    HX.toggle(i2, j2)
-
-def find_valid_cross_swap(HX: SparseBinMat, rng: random.Random, max_trials: int = 800
-) -> Optional[Tuple[int,int,int,int]]:
-    m = HX.m
-    for _ in range(max_trials):
-        i1, i2 = rng.sample(range(m), 2)
-        cand = list(HX.rows[i1] | HX.rows[i2])
-        if len(cand) < 2:
-            continue
-        j1, j2 = rng.sample(cand, 2)
-        if is_valid_cross_pattern(HX, i1, i2, j1, j2):
-            return i1, i2, j1, j2
-    return None
-
-
-# ======================
-# Simple block-ID seed
-# ======================
-
-def make_block_id_sparse(P: int, dc: int, dr: int) -> SparseBinMat:
-    """
-    Build (dc·P)×(dr·P) by tiling P×P identities across dc block-rows and dr block-cols.
-    Each row has weight dr; each column has weight dc.
-    """
-    H = SparseBinMat.zeros(dc * P, dr * P)
-    for br in range(dc):
-        for bc in range(dr):
-            for t in range(P):
-                H.add(br * P + t, bc * P + t)
-    return H
-
-
-# =========================
-# Global stabilizer checker
-# =========================
-
-def stabilizer_violation_positions(HX: SparseBinMat, HZ: SparseBinMat) -> List[Tuple[int, int]]:
-    """
-    Return all (k,i) such that
-      <HX_k, HZ_i> ⊕ <HZ_k, HX_i> = 1
-    i.e., (H_X H_Z^T ⊕ H_Z H_X^T)[k,i] = 1.
-    """
-    bad = []
-    for k in range(HX.m):
-        HXk = HX.rows[k]
-        HZk = HZ.rows[k]
-        for i in range(HX.m):
-            if dot_parity(HXk, HZ.rows[i]) ^ dot_parity(HZk, HX.rows[i]):
-                bad.append((k, i))
-    return bad
-
-def assert_stabilizer_ok(HX: SparseBinMat, HZ: SparseBinMat) -> None:
-    viol = stabilizer_violation_positions(HX, HZ)
-    assert not viol, f"Stabilizer violation exists: {len(viol)} pairs (e.g., {viol[:5]})"
-
-
-# ===================================
-# Neighborhood (general, symmetric)
-# ===================================
-
-def build_local_sets_general(
-    HXp: SparseBinMat, HZ: SparseBinMat, touched_cols: Set[int],
-    max_I: int = 16, max_J: int = 32, max_K: int = 32
-) -> Tuple[Set[int], Set[int], Set[int]]:
-    """
-    From columns touched by the H_X swap, collect:
-      I = rows incident via H_Z,
-      J = columns incident to I via H_Z or H'_X,
-      K = rows incident to J via H'_X or H_Z (K may intersect I).
-    """
-    I: Set[int] = set()
-    for j in touched_cols:
-        for i in HZ.cols[j]:
-            I.add(i)
-            if len(I) >= max_I:
-                break
-        if len(I) >= max_I:
-            break
-    if not I:
-        return set(), set(), set()
-
-    J: Set[int] = set()
-    for i in list(I):
-        for j in (HZ.rows[i] | HXp.rows[i]):
-            J.add(j)
-            if len(J) >= max_J:
-                break
-        if len(J) >= max_J:
-            break
-    if not J:
-        return set(), set(), set()
-
-    K: Set[int] = set()
-    for j in list(J):
-        for k in (HXp.cols[j] | HZ.cols[j]):
-            K.add(k)
-            if len(K) >= max_K:
-                break
-        if len(K) >= max_K:
-            break
-    return I, J, K
-
-
-# ==================================
-# Assemble general symmetric system
-# ==================================
-
-def assemble_general(
-    HXp: SparseBinMat, HZ: SparseBinMat,
-    I: Set[int], J: Set[int], K: Set[int]
-):
-    """
-    Variables: Δ_{i,j} for i∈I, j∈J (encoded column-wise).
-    For k∈K, i∈I:
-       (H'_X)_{k,J} Δ_{i,J}^T ⊕ Δ_{k,J} (H'_X)_{i,J}^T
-       = (H'_X H_Z^T ⊕ H_Z H'_X^T)_{k,i}
-    When k∉I, the second term vanishes.
-    """
-    I_list = sorted(I); J_list = sorted(J); K_list = sorted(K)
-    var_index: Dict[Tuple[int,int], int] = {
-        (i, j): idx
-        for idx, (i, j) in enumerate((ii, jj) for ii in I_list for jj in J_list)
-    }
-
-    row_eqs: List[Set[int]] = []
-    rhs: List[int] = []
-    Jset = set(J_list)
-
-    for k in K_list:
-        HXk_on_J = HXp.rows[k] & Jset
-        for i in I_list:
-            eq = set()
-            for j in HXk_on_J:
-                eq.add(var_index[(i, j)])                     # (H'_X)_{k,J} Δ_{i,J}^T
-            if k in I:
-                for j in (HXp.rows[i] & Jset):
-                    eq.add(var_index[(k, j)])                 # Δ_{k,J} (H'_X)_{i,J}^T
-            e = dot_parity(HXp.rows[k], HZ.rows[i]) ^ dot_parity(HZ.rows[k], HXp.rows[i])
-            row_eqs.append(eq)
-            rhs.append(e)
-
-    return row_eqs, rhs, var_index, I_list, J_list
-
-
-# ======================
-# GF(2) sparse solver
-# ======================
-
-def solve_gf2_sparse(row_eqs: List[Set[int]], rhs: List[int], nvars: int) -> Optional[List[int]]:
-    """
-    Sparse Gaussian elimination over GF(2) using set symmetric differences.
-    Rows are sets of active columns; free vars default to 0.
-    """
-    A = [set(r) for r in row_eqs]
-    b = rhs[:]
-    pivot_of_col: Dict[int, int] = {}
-    col_of_row: Dict[int, int] = {}
-
-    # forward elimination
-    for r in range(len(A)):
-        if not A[r]:
-            if b[r]:
-                return None
-            continue
-        while A[r]:
-            c = min(A[r])
-            if c in pivot_of_col:
-                pr = pivot_of_col[c]
-                A[r] ^= A[pr]; b[r] ^= b[pr]
-            else:
-                pivot_of_col[c] = r
-                col_of_row[r] = c
-                for rr in range(r + 1, len(A)):
-                    if c in A[rr]:
-                        A[rr] ^= A[r]; b[rr] ^= b[r]
-                break
-        if not A[r] and b[r]:
-            return None
-
-    # back substitution
-    x = [0] * nvars
-    for r in range(len(A) - 1, -1, -1):
-        if r not in col_of_row:
-            continue
-        c = col_of_row[r]
-        s = 0
-        for j in A[r]:
-            if j != c:
-                s ^= x[j]
-        x[c] = s ^ b[r]
-    return x
-
-
-# =====================================
-# Row/column balance (weight preserve)
-# =====================================
-
-def balanced_solution_from_vector(
-    x: List[int],
-    var_index: Dict[Tuple[int, int], int],
-    HZ: SparseBinMat,
-    I_list: List[int],
-    J_list: List[int]
-) -> bool:
-    """
-    Applying Δ encoded by x to H_Z must preserve row/column weights within I×J.
-    Count +1 for 0→1 and −1 for 1→0; sums per row/col must be zero.
-    """
-    R = {i: 0 for i in I_list}
-    C = {j: 0 for j in J_list}
-    inv = {idx: ij for ij, idx in var_index.items()}
-
-    for idx, val in enumerate(x):
-        if val:
-            i, j = inv[idx]
-            s = 1 - 2 * (1 if j in HZ.rows[i] else 0)
-            R[i] += s
-            C[j] += s
-
-    return all(v == 0 for v in R.values()) and all(v == 0 for v in C.values())
-
-
-# ==============================
-# Exact tiny-domain DFS fallback
-# ==============================
-
-def exact_balanced_solver(
-    row_eqs: List[Set[int]],
-    rhs: List[int],
-    var_index: Dict[Tuple[int, int], int],
-    HZ: SparseBinMat,
-    I_list: List[int],
-    J_list: List[int],
-    max_nodes: int = 200_000
-) -> Optional[List[int]]:
-    """
-    DFS with balance constraints for very small systems (exponential).
-    """
-    v = len(var_index)
-    var_eqs: List[List[int]] = [[] for _ in range(v)]
-    for r, cols in enumerate(row_eqs):
-        for c in cols:
-            var_eqs[c].append(r)
-
-    inv = {idx: ij for ij, idx in var_index.items()}
-    sgn_row = [0] * v
-    sgn_col = [0] * v
-    i_to_pos = {i: p for p, i in enumerate(I_list)}
-    j_to_pos = {j: p for p, j in enumerate(J_list)}
-    for idx, (i, j) in inv.items():
-        sgn = 1 - 2 * (1 if j in HZ.rows[i] else 0)
-        sgn_row[idx] = (i_to_pos[i], sgn)
-        sgn_col[idx] = (j_to_pos[j], sgn)
-
-    eqp = [0] * len(row_eqs)
-    R = [0] * len(I_list)
-    C = [0] * len(J_list)
-    deg = [0] * v
-    for cols in row_eqs:
-        for c in cols:
-            deg[c] += 1
-    order = sorted(range(v), key=lambda x: (-deg[x], x))
-    x = [0] * v
-    nodes = 0
-
-    def dfs(t: int) -> Optional[List[int]]:
-        nonlocal nodes
-        nodes += 1
-        if nodes > max_nodes:
-            return None
-        if t == v:
-            for r in range(len(row_eqs)):
-                if eqp[r] != rhs[r]:
-                    return None
-            if any(R) or any(C):
-                return None
-            return x[:]
-
-        j = order[t]
-        # try 0
-        sol = dfs(t + 1)
-        if sol is not None:
-            return sol
-
-        # try 1
-        x[j] = 1
-        changed = []
-        for r in var_eqs[j]:
-            eqp[r] ^= 1
-            changed.append(r)
-        ir, s = sgn_row[j]; jr, s2 = sgn_col[j]
-        R[ir] += s; C[jr] += s2
-
-        sol = dfs(t + 1)
-
-        # revert
-        for r in changed:
-            eqp[r] ^= 1
-        R[ir] -= s; C[jr] -= s2
-        x[j] = 0
-        return sol
-
-    return dfs(0)
-
-
-# ============================================
-# Adaptive local repair (general system only)
-# ============================================
-
-def adaptive_local_repair(
-    HX: SparseBinMat,
-    HZ: SparseBinMat,
-    HXp: SparseBinMat,
-    touched_cols: Set[int],
-    *,
-    max_domain_size: int = 400,
-    dfs_var_cap: int = 24
-) -> Tuple[bool, SparseBinMat]:
-    """
-    Locally repair H_Z after a proposed swap on H_X, using ONLY the general,
-    symmetric stabilizer linearization (no CSS-like fast path).
-
-    Steps:
-      1) Build (I,J,K) via build_local_sets_general.
-      2) Assemble general system A x = b with variables Δ_{i,j}.
-      3) Try sparse elimination; enforce local row/col balance.
-      4) If small and still unresolved, try exact DFS with balance constraints.
-      5) Verify global stabilizer constraint; return (True, repaired H_Z) if OK.
-    """
-    I, J, K = build_local_sets_general(HXp, HZ, touched_cols)
-    if not (I and J and K):
-        return False, HZ
-    if len(I) * len(J) > max_domain_size:
-        return False, HZ
-
-    row_eqs, rhs, var_index, I_list, J_list = assemble_general(HXp, HZ, I, J, K)
-
-    x = solve_gf2_sparse(row_eqs, rhs, len(var_index))
-    if x is not None and balanced_solution_from_vector(x, var_index, HZ, I_list, J_list):
-        HZ_new = HZ.copy()
-        inv = {idx: ij for ij, idx in var_index.items()}
-        for idx, val in enumerate(x):
-            if val:
-                i, j = inv[idx]
-                HZ_new.toggle(i, j)
-        if not stabilizer_violation_positions(HXp, HZ_new):
-            return True, HZ_new
-
-    if len(var_index) <= dfs_var_cap:
-        x = exact_balanced_solver(row_eqs, rhs, var_index, HZ, I_list, J_list)
-        if x is not None:
-            HZ_new = HZ.copy()
-            inv = {idx: ij for ij, idx in var_index.items()}
-            for idx, val in enumerate(x):
-                if val:
-                    i, j = inv[idx]
-                    HZ_new.toggle(i, j)
-            if not stabilizer_violation_positions(HXp, HZ_new):
-                return True, HZ_new
-
-    return False, HZ
-
-
-# ======================
-# Pretty printer (full)
-# ======================
-
-def print_sparse_01(A: SparseBinMat, name: str) -> None:
-    print(f"{name} (shape={A.m}x{A.n}, nnz={A.nnz()}):")
-    for i in range(A.m):
-        row = ["1" if j in A.rows[i] else "0" for j in range(A.n)]
-        print("".join(row))
-
-
-# ===============
-# Main runner
-# ===============
-
-def repeat_swaps_and_repairs_safe(
-    P: int = 25,
-    dc: int = 3,
-    dr: int = 4,
-    steps: int = 2000,
-    seed: int = 42,
-    max_trials: int = 300
-) -> Tuple[SparseBinMat, SparseBinMat]:
-    """
-    Repeat: propose a valid H_X cross-swap → locally repair H_Z (general system) →
-    verify stabilizer → commit (print) or discard and try again.
-    """
-    rng = random.Random(seed)
-
-    HX = make_block_id_sparse(P, dc, dr)
-    HZ = make_block_id_sparse(P, dc, dr)
-
-    # Initial sanity (should hold for the block-ID seed)
-    viol0 = stabilizer_violation_positions(HX, HZ)
-    if viol0:
-        print(f"[init] ⚠️ initial violation: {len(viol0)} pairs")
-
-    success_count = 0
-
-    for t in range(1, steps + 1):
-        committed = False
-
-        for trial in range(1, max_trials + 1):
-            pick = find_valid_cross_swap(HX, rng, max_trials=800)
-            if pick is None:
-                break
-
-            i1, i2, j1, j2 = pick
-            HXp = HX.copy()
-
-            # preserve H_X row/col weights
-            row_w_before = [len(HX.rows[i]) for i in range(HX.m)]
-            col_w_before = [len(HX.cols[j]) for j in range(HX.n)]
-
-            cross_swap_in_place(HXp, i1, i2, j1, j2)
-
-            row_w_after = [len(HXp.rows[i]) for i in range(HXp.m)]
-            col_w_after = [len(HXp.cols[j]) for j in range(HXp.n)]
-            assert row_w_before == row_w_after and col_w_before == col_w_after, \
-                "H_X weights changed by swap"
-
-            ok, HZ_new = adaptive_local_repair(HX, HZ, HXp, {j1, j2})
-            if ok:
-                # commit-time global check (defensive)
-                viol = stabilizer_violation_positions(HXp, HZ_new)
-                if viol:
-                    print(f"[step {t}] ⚠️ violation {len(viol)} pairs — discard candidate")
-                    continue
-
-                HX, HZ = HXp, HZ_new
-                success_count += 1
-                print(f"[step {t}] committed at trial {trial} (Global E=0, weights preserved)")
-                print_sparse_01(HX, "H_X")
-                print_sparse_01(HZ, "H_Z")
-
-                # post-commit re-check for logging
-                final_viol = stabilizer_violation_positions(HX, HZ)
-                if final_viol:
-                    print(f"[check] ⚠️ {len(final_viol)} violations remain")
-                else:
-                    print("[check] ✅ stabilizer OK")
-
-                print(f"[summary] commits so far: {success_count}/{t}")
-                committed = True
-                break
-
-        if not committed:
-            print(f"[step {t}] no feasible swap found. (commits so far: {success_count}/{t})")
-
-    print(f"[final] total commits: {success_count}/{steps}")
-
-    # final global check
-    final_viol = stabilizer_violation_positions(HX, HZ)
-    if final_viol:
-        print(f"[final check] ⚠️ {len(final_viol)} violations exist")
-    else:
-        print("[final check] ✅ stabilizer OK")
-
-    return HX, HZ
-
-
-if __name__ == "__main__":
-    # Reduce steps for interactivity; increase for larger search.
     repeat_swaps_and_repairs_safe()
