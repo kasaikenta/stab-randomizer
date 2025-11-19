@@ -191,6 +191,16 @@ def find_valid_cross_swap(
     """
     Randomly search for a valid 2×2 cross-swap on H_X.
 
+    Algorithm
+    ---------
+    1. Uniformly sample two distinct rows (i1,i2).
+    2. Form the set of candidate columns touched by either row and, if there
+       are at least two, uniformly sample two columns (j1,j2).
+    3. Check whether the 2×2 submatrix induced by (i1,i2,j1,j2) is a
+       cross-pattern whose diagonals can be toggled without changing row/column
+       weights via ``is_valid_cross_pattern``.
+    4. Repeat up to ``max_trials`` times, returning the first valid tuple.
+
     Parameters
     ----------
     HX : SparseBinMat
@@ -304,6 +314,16 @@ def build_local_sets_general(
     Build local index sets (I, J, K) for the general stabilizer case (K may
     intersect I). Use this when the CSS-like builder fails.
 
+    Algorithm
+    ---------
+    1. Seed ``I`` with rows of H_Z incident to the touched columns until the
+       ``max_I`` cap is met.
+    2. Expand to ``J`` by collecting every column touched by rows in ``I`` from
+       both H'_X and H_Z (capped by ``max_J``).
+    3. Expand again to ``K`` via rows touching the provisional ``J`` columns in
+       either matrix (capped by ``max_K``).
+    4. Abort early if any frontier is empty so the caller can try another swap.
+
     Parameters
     ----------
     HXp : SparseBinMat
@@ -368,6 +388,18 @@ def assemble_general(
 
     When k∉I, the Δ_{k,J} term is implicitly zero.
 
+    Algorithm
+    ---------
+    * Sort I,J,K to obtain deterministic index lists and assign each (i,j)∈I×J
+      a column in the linear system.
+    * For every k∈K build one equation per i∈I by:
+        a) Adding the variables corresponding to overlaps between row k of H'_X
+           and the J-domain (first bilinear term).
+        b) When k∈I, adding the variables representing row i overlaps so the
+           second bilinear term shares coefficients with Δ_{k,J}.
+    * Emit the commutator parity on the right-hand side using the original HX
+      and HZ rows.
+
     Returns
     -------
     row_eqs : List[Set[int]]
@@ -416,6 +448,17 @@ def solve_gf2_sparse(row_eqs: List[Set[int]], rhs: List[int], nvars: int) -> Opt
     Solve A x = b over GF(2) where each row of A is given as a set of active
     column indices (sparse support). Uses a simple sparse Gaussian elimination
     with symmetric-difference operations on sets.
+
+    Algorithm
+    ---------
+    1. Clone each row support so mutations do not leak to callers.
+    2. Sweep the rows from top to bottom, picking the smallest column index in
+       the current support as the candidate pivot. If that column already has a
+       pivot row, symmetric-difference the two rows (elimination); otherwise
+       record the pivot and eliminate the column from all lower rows.
+    3. Abort immediately when a zero row has RHS=1 (inconsistent system).
+    4. Perform a backward sweep that assigns pivot variables first and treats
+       unpivoted variables as free zeros.
 
     Parameters
     ----------
@@ -521,6 +564,17 @@ def exact_balanced_solver(
     Exact brute-force (DFS) solver for tiny local systems with balance constraints.
     Useful when elimination under-constrains the solution and we need an exact,
     weight-preserving Δ.
+
+    Algorithm
+    ---------
+    * Precompute equation adjacencies and the ±1 contribution that each
+      variable would apply to every affected row/column balance in H_Z.
+    * Order the variables by decreasing equation degree for stronger pruning.
+    * Run depth-first search that first tries assigning 0, then 1. When testing
+      1 the solver flips cached parities and accumulates row/column balances,
+      unwinding on backtrack.
+    * Terminate when every equation parity matches ``rhs`` and all balances are
+      zero, or when the node budget ``max_nodes`` is exceeded.
 
     Parameters
     ----------
@@ -716,6 +770,19 @@ def repeat_swaps_and_repairs_safe(
     """
     Repeatedly apply random cross-swaps to H_X and repair H_Z locally.
     Validate the stabilizer constraint (H_X H_Z^T ⊕ H_Z H_X^T = 0) at each step.
+
+    Algorithm
+    ---------
+    1. Initialize H_X and H_Z with the balanced block-diagonal pattern produced
+       by ``make_block_id_sparse``.
+    2. For every outer iteration, repeatedly sample a valid cross-swap via
+       ``find_valid_cross_swap`` and simulate it on a copy of H_X.
+    3. Invoke ``adaptive_local_repair`` to obtain a candidate H_Z update, and
+       discard the attempt unless the commutator violations disappear.
+    4. Commit the new pair (H_X, H_Z) only when weights and commutation checks
+       succeed, otherwise try another swap until ``max_trials`` is exhausted.
+    5. Emit verbose diagnostics—including the full matrices—after each commit
+       and re-check the constraint at the very end.
 
     Parameters
     ----------
