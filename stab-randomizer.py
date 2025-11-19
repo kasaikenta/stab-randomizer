@@ -1,18 +1,32 @@
 from __future__ import annotations
 # -*- coding: utf-8 -*-
 """
-Stabilizer LDPC: repeated cross-swap + local repair (general stabilizer case)
+Stabilizer LDPC randomizer
+==========================
 
-- Fully sparse (set-based) implementation suitable for larger P (e.g., P=15+)
-- Preserves H_X row/col weights (via valid 2×2 cross-swap only)
-- Preserves H_Z row/col weights on commit (balanced Δ)
-- Prints full matrices (no truncation) on each commit; default run is large, so
-  prefer smaller 'steps' when experimenting.
+The script repeatedly performs random 2×2 cross-swaps on a sparse pair of
+stabilizer parity-check matrices (H_X, H_Z) and immediately repairs any newly
+introduced violations by solving local GF(2) systems. The end result is a
+shuffled-but-valid pair of checks that keeps every row/column weight untouched.
 
-Debug-oriented design choices:
-- If the CSS-like local system fails, fall back to the general stabilizer system.
-- If kernel search is insufficient on tiny domains, try an exact balanced solver.
-- Logic is written to be test-friendly; add tests rather than changing existing ones.
+High-level algorithm
+--------------------
+1. Sample a random cross pattern that preserves H_X weights exactly.
+2. Apply the swap tentatively, measure the resulting stabilizer defects, and
+   assemble a linear system describing the needed repair inside H_Z.
+3. Solve the system with sparse Gaussian elimination; if it fails, fall back to
+   a DFS-based balanced solver before finally undoing the swap as a last resort.
+4. Commit the swap plus repair when both H_X and H_Z keep their weights and the
+   commutation constraints remain satisfied.
+
+Implementation notes
+--------------------
+- Uses fully sparse (set-based) data structures suited to large block lengths
+  (P ≳ 15) and prints the complete matrices at each accepted step.
+- Keeps the stabilizer-specific helpers alongside the general solvers so the
+  flow can gracefully degrade from the fast path to exhaustive repair.
+- Designed for debugging: extensive logging, deterministic test seams, and no
+  hidden global state.
 """
 from dataclasses import dataclass
 from typing import List, Set, Dict, Tuple, Optional
@@ -312,7 +326,17 @@ def build_local_sets_general(
 ) -> Tuple[Set[int], Set[int], Set[int]]:
     """
     Build local index sets (I, J, K) for the general stabilizer case (K may
-    intersect I). Use this when the CSS-like builder fails.
+    intersect I). Use this when the structured fast path fails.
+
+    Algorithm
+    ---------
+    1. Seed ``I`` with rows of H_Z incident to the touched columns until the
+       ``max_I`` cap is met.
+    2. Expand to ``J`` by collecting every column touched by rows in ``I`` from
+       both H'_X and H_Z (capped by ``max_J``).
+    3. Expand again to ``K`` via rows touching the provisional ``J`` columns in
+       either matrix (capped by ``max_K``).
+    4. Abort early if any frontier is empty so the caller can try another swap.
 
     Algorithm
     ---------
@@ -682,7 +706,7 @@ def adaptive_local_repair(
 ) -> Tuple[bool, SparseBinMat]:
     """
     Locally repair H_Z after a proposed swap on H_X, using ONLY the general
-    stabilizer linearization (no CSS-like fast path).
+    stabilizer linearization (no structured fast path).
 
     Strategy
     --------
